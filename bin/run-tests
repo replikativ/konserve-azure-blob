@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$project_dir"
+
+cleanup() {
+  docker compose down --volumes
+}
+trap cleanup EXIT
+
+docker compose up -d --wait
+clojure -M:test -m konserve-azure-blob.test-runner
+

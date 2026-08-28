@@ -1,0 +1,69 @@
+version: 2.1
+
+orbs:
+  tools: replikativ/clj-tools@0
+
+jobs:
+  smoke:
+    docker:
+      - image: clojure:temurin-21-tools-deps
+    steps:
+      - checkout
+      - run:
+          name: Load namespace against pinned konserve
+          command: clojure -M -e "(require 'konserve-azure-blob.core)(println :loaded)"
+
+  unittest:
+    docker:
+      - image: clojure:temurin-21-tools-deps
+      - image: mcr.microsoft.com/azure-storage/azurite:3.36.0
+        command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --inMemoryPersistence --disableTelemetry
+    steps:
+      - checkout
+      - run:
+          name: Wait for Azurite
+          command: |
+            for i in $(seq 1 60); do (echo > /dev/tcp/localhost/10000) 2>/dev/null && exit 0; sleep 1; done
+            echo "Azurite did not come up on :10000"; exit 1
+      - run:
+          name: Run Azurite tests
+          command: clojure -M:test -m konserve-azure-blob.test-runner
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - tools/setup:
+          context: docker-deploy
+          setup_cljs: false
+      - tools/build:
+          context: docker-deploy
+          build_cljs: false
+          requires:
+            - tools/setup
+      - tools/format:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - smoke
+      - unittest
+      - tools/deploy:
+          context:
+            - clojars-deploy
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - tools/build
+            - tools/format
+            - smoke
+            - unittest
+      - tools/release:
+          context:
+            - github-token
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - tools/deploy
