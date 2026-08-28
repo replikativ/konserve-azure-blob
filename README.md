@@ -3,9 +3,10 @@
 An [Azure Blob Storage](https://azure.microsoft.com/products/storage/blobs)
 backend for [konserve](https://github.com/replikativ/konserve) and Datahike.
 
-The project and artifact use `azure-blob` rather than `abs`: the name is
-immediately recognizable, does not overload the common “absolute value/path”
-abbreviation, and leaves room for other Azure storage backends.
+Azure Blob Storage is Azure's object storage service. This adapter maps each
+konserve store to an isolated blob prefix within a container and uses blob ETags
+for optimistic concurrency, providing durable shared storage for distributed
+konserve and Datahike deployments.
 
 ## Usage
 
