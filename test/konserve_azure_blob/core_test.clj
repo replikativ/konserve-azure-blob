@@ -3,7 +3,8 @@
             [clojure.test :refer [deftest is testing]]
             [konserve-azure-blob.core :as azure]
             [konserve.binary :as binary]
-            [konserve.compliance-test :refer [compliance-test]]
+            [konserve.compliance-test :refer [compliance-test
+                                              conditional-write-compliance-test]]
             [konserve.core :as k]
             [konserve.impl.storage-layout :as layout]
             [konserve.store :as store])
@@ -361,3 +362,53 @@
         (layout/-close blob {:sync? true})
         (store/release-store spec konserve-store {:sync? true})
         (store/delete-store spec {:sync? true})))))
+
+(deftest azure-conditional-write-test
+  (testing "the `:expected-revision` contract against a real Azure Blob endpoint.
+
+            This backing answers `:global`, and it can: the comparison is Azure's
+            own If-Match, evaluated by the service, not a lock local to a heap or
+            a host. Running konserve's shared contract against a live endpoint is
+            the only thing standing between that claim and a deployment trusting
+            it -- a backing that declares a domain it cannot honour is worse than
+            one that declares none, because the caller believes it is fenced."
+    (let [spec (test-spec)
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _ nil))
+          s    (store/create-store spec {:sync? true})]
+      (try
+        (is (= :global (k/conditional-write-domain s))
+            "Azure evaluates the precondition, so the domain reaches every writer")
+        (conditional-write-compliance-test s)
+        (finally
+          (store/release-store spec s {:sync? true})
+          (try (store/delete-store spec {:sync? true}) (catch Exception _ nil)))))))
+
+(deftest azure-refuses-a-precondition-it-cannot-build-test
+  (testing "an `:expected-revision` with no ETag to fence against must be REFUSED.
+
+            Writing unconditionally there would hand back a knob that reads as
+            handled: the caller asked for a compare-and-set and would get a plain
+            overwrite. Asserted at the blob, not through the store, because
+            konserve performs the write's own header read and so always supplies
+            an ETag on the public path -- the guard is defensive, and the only
+            honest way to cover it is to construct the state it defends against."
+    (let [spec (test-spec)
+          _    (try (store/delete-store spec {:sync? true}) (catch Exception _ nil))
+          st   (store/create-store spec {:sync? true})]
+      (try
+        (k/assoc st :some-key {:v 1} {:sync? true})
+        (let [backing (:backing st)
+              ;; A blob that has read nothing: no ETag of its own, none cached.
+              blob (layout/-create-blob backing :some-key {:sync? true})
+              _    (reset! (:etag-cache backing) {})
+              bytes (fn [n] (byte-array (repeat n (byte 1))))
+              _    (reset! (:data blob) {:header (bytes 8) :meta (bytes 4) :value (bytes 4)})
+              r    (try (layout/-sync blob {:sync? true :expected-revision "no-etag-was-read"})
+                        (catch Exception e e))]
+          (is (= :konserve/conditional-write-unsupported (:type (ex-data r)))
+              "refuses rather than silently writing unconditionally"))
+        (is (= {:v 1} (k/get st :some-key nil {:sync? true}))
+            "and the refused write left the stored value untouched")
+        (finally
+          (store/release-store spec st {:sync? true})
+          (try (store/delete-store spec {:sync? true}) (catch Exception _ nil)))))))

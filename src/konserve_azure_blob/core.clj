@@ -2,7 +2,8 @@
   "Azure Blob Storage backend for konserve."
   (:require [clojure.core.async :refer [<!! close! go promise-chan put!]]
             [clojure.core.async.impl.protocols :as async-proto]
-            [konserve.impl.defaults :refer [connect-default-store normalize-store-config]]
+            [konserve.impl.defaults :refer [absent connect-default-store normalize-store-config]]
+            [konserve.protocols :as protocols]
             [konserve.impl.storage-layout :as layout
              :refer [PBackingBlob PBackingLock PBackingStore PReadMissSafe PStreamingBinaryWrite
                      -delete-store store-key-not-found-ex]]
@@ -156,10 +157,19 @@
     (catch BlobStorageException e
       (if (not-found? e) ::not-found (throw e)))))
 
-(defn- request-conditions [expected-etag]
-  (when expected-etag
-    (doto (BlobRequestConditions.)
-      (.setIfMatch expected-etag))))
+(defn- request-conditions
+  "Blob preconditions for a write, or nil for an unconditional one.
+
+   `:absent` means create-if-absent -- `If-None-Match: *` -- which is what a
+   caller holding the absent sentinel is entitled to: the key must still not
+   exist. Anything else is an ETag and becomes `If-Match`."
+  [precondition]
+  (cond
+    (= :absent precondition) (doto (BlobRequestConditions.)
+                               (.setIfNoneMatch "*"))
+    precondition             (doto (BlobRequestConditions.)
+                               (.setIfMatch precondition))
+    :else                    nil))
 
 (defn- optimistic-conflict [name expected-etag cause]
   (ex-info "Azure Blob optimistic lock conflict."
@@ -213,15 +223,18 @@
     conditions (.setRequestConditions ^BlobRequestConditions conditions)))
 
 (defn- write-stream!
-  [^BlobContainerClient container-client name ^InputStream input length expected-etag]
+  "Upload `input`, honouring `precondition` (an ETag, `:absent`, or nil for an
+   unconditional write). Returns false when the precondition failed, so the
+   caller can decide whether that is a retry or an error."
+  [^BlobContainerClient container-client name ^InputStream input length precondition]
   (try
     (.uploadWithResponse
      (blob-client container-client name)
-     (stream-upload-options input length (request-conditions expected-etag))
+     (stream-upload-options input length (request-conditions precondition))
      Context/NONE)
     true
     (catch BlobStorageException e
-      (if (and expected-etag (precondition-failed? e))
+      (if (and precondition (precondition-failed? e))
         false
         (throw e)))))
 
@@ -511,6 +524,14 @@
   (reset! data {})
   (reset! total-size nil)
   (reset! etag nil)
+  ;; The shared cache entry is dropped here, as before: it is scoped to one
+  ;; open blob, and retaining every read key is the unbounded growth
+  ;; `etag-cache-does-not-retain-read-keys-test` exists to prevent.
+  ;;
+  ;; A FENCED write does not depend on it surviving. konserve performs the
+  ;; write's own header read on the same blob instance that is then synced, so
+  ;; the ETag is still in this blob's `etag` field when `-sync` builds its
+  ;; precondition -- which is also the read the precondition should cover.
   (swap! (:etag-cache backing) dissoc name)
   nil)
 
@@ -521,19 +542,48 @@
      (:sync? env) io-sync-translation
      (io-try-
       (let [{:keys [header meta value]} @data
-            current-etag (get @(:etag-cache backing) name)
+            current-etag (or @etag (get @(:etag-cache backing) name))
+            expected-revision (:expected-revision env)
             retries (get-in env [:config :optimistic-locking-retries] 0)]
         (when-not (and header meta value)
           (throw (ex-info "Updating a row requires header, metadata, and value."
                           {:components (component-summary @data)})))
         (let [{:keys [input length]} (combined-upload-source header meta value)]
           (with-open [input input]
-            (when-not (write-stream! (:container-client backing)
-                                     name
-                                     input
-                                     length
-                                     (when (pos? retries) current-etag))
-              (throw (optimistic-conflict name current-etag nil)))))
+            (if expected-revision
+              ;; FENCED. konserve has already compared the revision it read
+              ;; against the caller's; the ETag precondition closes the window
+              ;; BETWEEN that read and this write, which is the half no
+              ;; comparison in our own process can do. Both together are the
+              ;; compare-and-set, and Azure evaluates this half -- which is why
+              ;; the declared domain is :global.
+              ;;
+              ;; A create-if-absent has no ETag to match, and says so.
+              (let [precondition (if (= absent expected-revision) :absent current-etag)]
+                (when-not precondition
+                  ;; No ETag means no read happened, so there is nothing to fence
+                  ;; against. REFUSE rather than write unconditionally: the caller
+                  ;; asked for a guarantee, and silently withholding it is worse
+                  ;; than not offering one -- see konserve.protocols/PConditionalWrite.
+                  (throw (ex-info (str "Cannot honour :expected-revision: no ETag was read "
+                                       "for this key, so the write cannot be made conditional.")
+                                  {:type :konserve/conditional-write-unsupported
+                                   :key  name})))
+                (when-not (write-stream! (:container-client backing) name input length precondition)
+                  (throw (ex-info (str "Conditional write rejected: the stored revision is not "
+                                       "the one this value was derived from.")
+                                  {:type     :konserve/revision-mismatch
+                                   :key      name
+                                   :expected expected-revision}))))
+              ;; UNFENCED. Unchanged: the pre-existing optimistic-locking path,
+              ;; where the ETag is applied only when the caller opted into
+              ;; retries and konserve's own loop handles the conflict.
+              (when-not (write-stream! (:container-client backing)
+                                       name
+                                       input
+                                       length
+                                       (when (pos? retries) current-etag))
+                (throw (optimistic-conflict name current-etag nil))))))
         (reset! data {})
         (reset! total-size nil)
         (reset! etag nil)
@@ -560,7 +610,27 @@
                              :total-size (:total-size response)})))
           (reset! total-size (:total-size response))
           (reset! etag (:etag response))
-          (when (pos? (get-in env [:config :optimistic-locking-retries] 0))
+          ;; Cache the ETag when this read is part of a FENCED exchange, and
+          ;; only then.
+          ;;
+          ;; It used to be gated solely on `:optimistic-locking-retries`, which
+          ;; defaults to 0 -- so by default no ETag was ever cached, a fenced
+          ;; write had no precondition to offer, and it refused itself. Fencing
+          ;; is a per-write decision the caller makes through
+          ;; `:expected-revision`; it cannot depend on a retry knob set at
+          ;; connect time.
+          ;;
+          ;; Caching on EVERY read would fix that and reintroduce the unbounded
+          ;; growth `etag-cache-does-not-retain-read-keys-test` exists to
+          ;; prevent. konserve marks the two reads that are part of a fenced
+          ;; exchange: `:revision-read?` on the read that hands the caller its
+          ;; token, and `:expected-revision` on the write's own read. Those are
+          ;; exactly the entries a conditional write needs, and an ordinary read
+          ;; still retains nothing.
+          (when (and (:etag response)
+                     (or (:revision-read? env)
+                         (some? (:expected-revision env))
+                         (pos? (get-in env [:config :optimistic-locking-retries] 0))))
             (swap! (:etag-cache backing) assoc name (:etag response)))
           (reset! data {:header (Arrays/copyOf ^bytes (:data response)
                                                layout/header-size)})))
@@ -626,6 +696,16 @@
       (.endsWith ^String name ".ksv.backup")))
 
 (defrecord AzureBlobContainer [service-client container-client container store-path etag-cache]
+  ;; Azure evaluates the precondition itself -- the If-Match rides on the
+  ;; upload request -- so the guarantee does not depend on any lock of ours.
+  ;; Reach and mechanism are separate questions; this marker answers the second.
+  protocols/PSelfConditionalWrite
+
+  protocols/PConditionalWrite
+  ;; `:global`. The comparison happens in Azure Blob Storage, so it holds against
+  ;; every writer anywhere, not merely those sharing a heap or a host.
+  (-conditional-write-domain [_] :global)
+
   PBackingStore
   (-create-blob [this store-key env]
     (async+sync (:sync? env) *default-sync-translation*
