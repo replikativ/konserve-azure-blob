@@ -1,5 +1,10 @@
 # konserve-azure-blob
 
+[![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/CB7GJAN0L)
+[![Clojars](https://img.shields.io/clojars/v/org.replikativ/konserve-azure-blob.svg)](https://clojars.org/org.replikativ/konserve-azure-blob)
+[![CircleCI](https://circleci.com/gh/replikativ/konserve-azure-blob.svg?style=shield)](https://circleci.com/gh/replikativ/konserve-azure-blob)
+[![Last commit](https://img.shields.io/github/last-commit/replikativ/konserve-azure-blob/main.svg)](https://github.com/replikativ/konserve-azure-blob/tree/main)
+
 An [Azure Blob Storage](https://azure.microsoft.com/products/storage/blobs)
 backend for [konserve](https://github.com/replikativ/konserve) and Datahike.
 
@@ -12,7 +17,7 @@ konserve and Datahike deployments.
 
 Add to your dependencies:
 
-[![Clojars Project](http://clojars.org/org.replikativ/konserve-azure-blob/latest-version.svg)](http://clojars.org/org.replikativ/konserve-azure-blob)
+[![Clojars](https://img.shields.io/clojars/v/org.replikativ/konserve-azure-blob.svg)](https://clojars.org/org.replikativ/konserve-azure-blob)
 
 ### Configuration
 
@@ -124,6 +129,41 @@ How it works:
 
 The client pins Azure Blob service API `2025-11-05`, which Azurite 3.36.0
 implements. This backend does not depend on newer Blob features.
+
+## Streaming and memory limits
+
+Binary values are uploaded and downloaded as streams. The `InputStream` passed
+to a streaming `bget` callback remains open until the callback, or the
+core.async channel it returns, completes. Reads and writes therefore do not
+need to materialize an entire binary blob in JVM memory. Blob copies used by
+konserve's storage layout are streamed as well.
+
+Metadata and ordinary EDN values must be materialized for deserialization, so
+their declared lengths are checked against the blob size and configurable
+limits before a byte array is allocated. The defaults are 16 MiB for metadata
+and 256 MiB for an EDN value:
+
+```clojure
+{:backend :azure-blob
+ :account-name "my-storage-account"
+ :container "konserve"
+ :id (random-uuid)
+ :config {:max-metadata-size (* 16 1024 1024)
+          :max-edn-value-size (* 256 1024 1024)}}
+```
+
+Choose limits appropriate for the application's JVM heap and expected value
+sizes. Large payloads should use konserve's binary API.
+
+Blocking Azure SDK calls run on a bounded shared executor (64 active requests
+and a queue of 1,024). If both are exhausted, an asynchronous operation returns
+an exception with type `:azure-blob-io-saturated`, allowing the application to
+apply backpressure or retry instead of retaining work without limit.
+
+Service clients are also kept in a bounded cache of 64 entries. Applications
+with dynamic, tenant-specific credentials can pass a managed
+`:service-client`; `clear-client-cache!` is available for credential rotation
+and test isolation.
 
 ## Authentication and permissions
 

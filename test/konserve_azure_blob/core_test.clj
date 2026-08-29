@@ -1,12 +1,17 @@
 (ns konserve-azure-blob.core-test
-  (:require [clojure.core.async :refer [<!!]]
+  (:require [clojure.core.async :refer [<!! go promise-chan put! thread]]
             [clojure.test :refer [deftest is testing]]
             [konserve-azure-blob.core :as azure]
+            [konserve.binary :as binary]
             [konserve.compliance-test :refer [compliance-test]]
             [konserve.core :as k]
             [konserve.impl.storage-layout :as layout]
             [konserve.store :as store])
-  (:import [java.nio.charset StandardCharsets]
+  (:import [com.azure.core.credential AzureSasCredential]
+           [com.azure.storage.blob.models ListBlobsOptions]
+           [java.io InputStream StringReader]
+           [java.nio ByteBuffer]
+           [java.nio.charset StandardCharsets]
            [java.util UUID]))
 
 (def emulator-base
@@ -22,6 +27,55 @@
 
 (defn- string [value]
   (String. ^bytes value StandardCharsets/UTF_8))
+
+(defn- exception-type [value]
+  (some-> value ex-data :type))
+
+(defn- generated-input-stream [size]
+  (let [position (atom 0)]
+    (proxy [InputStream] []
+      (read
+        ([]
+         (if (= @position size)
+           -1
+           (let [value (mod @position 251)]
+             (swap! position inc)
+             value)))
+        ([target offset length]
+         (if (= @position size)
+           -1
+           (let [count (int (min length (- size @position)))]
+             (dotimes [index count]
+               (aset-byte ^bytes target (+ offset index)
+                          (unchecked-byte (mod (+ @position index) 251))))
+             (swap! position + count)
+             count)))))))
+
+(defn- stream-summary [^InputStream input]
+  (let [buffer (byte-array (* 64 1024))]
+    (loop [size 0
+           checksum 0]
+      (let [read (.read input buffer)]
+        (if (= -1 read)
+          {:size size :checksum checksum}
+          (recur (+ size read)
+                 (loop [index 0
+                        checksum checksum]
+                   (if (= index read)
+                     checksum
+                     (recur (inc index)
+                            (mod (+ checksum (bit-and 0xff (aget buffer index)))
+                                 1000000007))))))))))
+
+(defn- expected-summary [size]
+  (let [period 251
+        period-sum (quot (* period (dec period)) 2)
+        complete-periods (quot size period)
+        remainder (rem size period)]
+    {:size size
+     :checksum (mod (+ (* complete-periods period-sum)
+                       (quot (* remainder (dec remainder)) 2))
+                    1000000007)}))
 
 (deftest azurite-etag-cas-test
   (testing "Azurite enforces ETag If-Match compare-and-swap"
@@ -137,4 +191,173 @@
       (is (satisfies? layout/PReadMissSafe (:backing konserve-store)))
       (is (= ::missing (k/get konserve-store :absent ::missing {:sync? true})))
       (finally
+        (store/delete-store spec {:sync? true})))))
+
+(deftest async-bget-awaits-callback-test
+  (let [spec (test-spec)
+        konserve-store (store/create-store spec {:sync? true})]
+    (try
+      (k/bassoc konserve-store :binary "callback-value" {:sync? true})
+      (let [result (<!! (k/bget konserve-store
+                                :binary
+                                (fn [{:keys [input-stream]}]
+                                  (go (slurp input-stream)))
+                                {:sync? false :streaming? true}))]
+        (is (= "callback-value" result))
+        (is (string? result)
+            "one take must return the callback value, not another channel"))
+      (let [failure (<!! (k/bget konserve-store
+                                 :binary
+                                 (fn [_]
+                                   (doto (promise-chan)
+                                     (put! (ex-info "callback failed"
+                                                    {:type :callback-failure}))))
+                                 {:sync? false :streaming? true}))]
+        (is (= :callback-failure (exception-type failure))))
+      (finally
+        (store/release-store spec konserve-store {:sync? true})
+        (store/delete-store spec {:sync? true})))))
+
+(deftest bounded-streaming-binary-test
+  (let [spec (test-spec)
+        konserve-store (store/create-store spec {:sync? true})
+        size (* 8 1024 1024)]
+    (try
+      (is (satisfies? layout/PStreamingBinaryWrite
+                      (layout/-create-blob (:backing konserve-store)
+                                           "streaming-probe.ksv"
+                                           {:sync? true})))
+      (is (true? (k/bassoc konserve-store :large-stream
+                           (generated-input-stream size)
+                           {:sync? true})))
+      (is (= (expected-summary size)
+             (<!! (k/bget konserve-store
+                          :large-stream
+                          (fn [{:keys [input-stream]}]
+                            (thread (stream-summary input-stream)))
+                          {:sync? false :streaming? true}))))
+      (finally
+        (store/release-store spec konserve-store {:sync? true})
+        (store/delete-store spec {:sync? true})))))
+
+(deftest reader-input-stream-preserves-unicode-test
+  (let [spec (test-spec)
+        konserve-store (store/create-store spec {:sync? true})
+        value "emoji: 😀 and ����"]
+    (try
+      (k/bassoc konserve-store :unicode-reader (StringReader. value) {:sync? true})
+      (is (= value
+             (String. ^bytes (k/bget konserve-store
+                                     :unicode-reader
+                                     (binary/to-bytes {:sync? true})
+                                     {:sync? true})
+                      StandardCharsets/UTF_8)))
+      (finally
+        (store/release-store spec konserve-store {:sync? true})
+        (store/delete-store spec {:sync? true})))))
+
+(deftest corrupt-metadata-size-is-rejected-test
+  (let [spec (test-spec)
+        konserve-store (store/create-store spec {:sync? true})
+        service (azure/service-client spec)
+        container (.getBlobContainerClient service (:container spec))]
+    (try
+      (k/assoc konserve-store :victim {:small true} {:sync? true})
+      (let [prefix (str (azure/spec->store-path spec) "/")
+            options (doto (ListBlobsOptions.) (.setPrefix prefix))
+            name (->> (.iterator (.listBlobs container options nil))
+                      iterator-seq
+                      (map #(.getName %))
+                      (filter #(.endsWith ^String % ".ksv"))
+                      first)
+            object (azure/read-object container name)
+            bytes ^bytes (:data object)]
+        (.putInt (ByteBuffer/wrap bytes) 4 (* 1024 1024 1024))
+        (azure/write-object! container name bytes nil)
+        (let [failure (try
+                        (k/get konserve-store :victim nil {:sync? true})
+                        nil
+                        (catch Exception e e))]
+          (is (= :invalid-blob-layout (exception-type failure)))))
+      (finally
+        (store/release-store spec konserve-store {:sync? true})
+        (store/delete-store spec {:sync? true})))))
+
+(deftest etag-cache-does-not-retain-read-keys-test
+  (let [spec (assoc (test-spec) :config {:optimistic-locking-retries 10})
+        konserve-store (store/create-store spec {:sync? true})]
+    (try
+      (doseq [key (range 50)]
+        (k/assoc konserve-store key key {:sync? true}))
+      (doseq [key (range 50)]
+        (is (= key (k/get konserve-store key nil {:sync? true}))))
+      (is (empty? @(:etag-cache (:backing konserve-store))))
+      (finally
+        (store/release-store spec konserve-store {:sync? true})
+        (store/delete-store spec {:sync? true})))))
+
+(deftest stale-read-does-not-condition-full-overwrite-test
+  (let [spec (assoc (test-spec) :config {:optimistic-locking-retries 3})
+        store-a (store/create-store spec {:sync? true})
+        store-b (store/connect-store spec {:sync? true})]
+    (try
+      (k/assoc store-a :key :v1 {:sync? true})
+      (is (= :v1 (k/get store-a :key nil {:sync? true})))
+      (k/assoc store-b :key :v2 {:sync? true})
+      (is (= [nil :v3] (k/assoc store-a :key :v3 {:sync? true})))
+      (is (= :v3 (k/get store-b :key nil {:sync? true})))
+      (finally
+        (store/release-store spec store-a {:sync? true})
+        (store/release-store spec store-b {:sync? true})
+        (store/delete-store spec {:sync? true})))))
+
+(deftest caches-and-queues-are-bounded-test
+  (azure/clear-client-cache!)
+  (try
+    (is (thrown? Exception (azure/service-client {})))
+    (is (zero? (azure/client-cache-size))
+        "failed client construction must not poison the cache")
+    (let [credential (AzureSasCredential. "sig=test")]
+      (doseq [port (range 20000 (+ 20000 azure/max-cached-clients 10))]
+        (azure/service-client {:endpoint (str "http://127.0.0.1:" port)
+                               :credential credential}))
+      (is (= azure/max-cached-clients (azure/client-cache-size))))
+    (is (= azure/io-queue-capacity
+           (:queue-capacity (azure/io-executor-stats))))
+    (finally
+      (azure/clear-client-cache!))))
+
+(deftest backing-key-listing-is-realized-test
+  (let [spec (test-spec)
+        konserve-store (store/create-store spec {:sync? true})]
+    (try
+      (k/assoc konserve-store :key :value {:sync? true})
+      (is (vector? (layout/-keys (:backing konserve-store) {:sync? true})))
+      (finally
+        (store/release-store spec konserve-store {:sync? true})
+        (store/delete-store spec {:sync? true})))))
+
+(deftest incomplete-write-error-omits-payload-test
+  (let [spec (test-spec)
+        konserve-store (store/create-store spec {:sync? true})
+        blob (layout/-create-blob (:backing konserve-store)
+                                  "incomplete.ksv"
+                                  {:sync? true})
+        secret (utf8-bytes "payload-that-must-not-appear-in-errors")]
+    (try
+      (layout/-write-header blob secret {:sync? true})
+      (let [failure (try
+                      (layout/-sync blob {:sync? true :config {}})
+                      nil
+                      (catch Exception e e))
+            error-data (ex-data failure)]
+        (is (instance? Exception failure))
+        (is (= {:header {:present? true :bytes (alength secret)}}
+               (:components error-data)))
+        (is (not (contains? error-data :data)))
+        (is (not (.contains (pr-str error-data)
+                            "payload-that-must-not-appear-in-errors"))))
+      (finally
+        (layout/-close blob {:sync? true})
+        (store/release-store spec konserve-store {:sync? true})
         (store/delete-store spec {:sync? true})))))
