@@ -1,6 +1,12 @@
 {:paths ["src"]
- :deps {com.azure/azure-identity             {:mvn/version "1.18.5"}
-        com.azure/azure-storage-blob         {:mvn/version "12.35.0"}
+ :deps {;; The backend uses the synchronous Blob client. Prefer the JDK HTTP
+        ;; provider so consumers do not inherit Netty plus native TLS binaries
+        ;; for every supported platform.
+        com.azure/azure-core-http-jdk-httpclient {:mvn/version "1.1.7"}
+        com.azure/azure-identity             {:mvn/version "1.18.5"
+                                              :exclusions [com.azure/azure-core-http-netty]}
+        com.azure/azure-storage-blob         {:mvn/version "12.35.0"
+                                              :exclusions [com.azure/azure-core-http-netty]}
         org.clojure/clojure                  {:mvn/version "1.12.3"}
         org.replikativ/konserve              {:mvn/version "0.9.389"}
         org.replikativ/logging               {:mvn/version "0.1.3"}
